@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<!--
+  «Sol detrás de la cima» — visor interactivo
+  ===========================================
+  Página autocontenida: haz clic en cualquier punto del mapa y calcula en qué
+  fechas y horas de 2026 el Sol sale exactamente detrás de Monserrate y de
+  Guadalupe visto desde ese punto. También dibuja los dos loci de los
+  solsticios (la "envolvente": desde esos puntos la alineación ocurre el día
+  del solsticio).
+
+  Toda la física está en JavaScript (algoritmo solar NOAA/Meeus de baja
+  precisión, validado contra astropy: error < 0.1° en azimut, < 0.01° en
+  altitud, mucho menor que el diámetro del Sol, 0.53°). Misma geometría que
+  scripts/sol_detras_cima.py: ENU esférico centrado en la Plaza de Bolívar,
+  observador a 2600 m, sin refracción, hora local UTC−5.
+
+  Solo necesita internet para las teselas del mapa (OpenStreetMap) y la
+  librería Leaflet; el cálculo es 100 % local. Ábrela con doble clic.
+-->
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sol detrás de la cima — Bogotá 2026</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+  html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+  #mapa { height: 100%; }
+  /* Panel de resultados sobre el mapa */
+  #panel {
+    position: absolute; top: 10px; right: 10px; z-index: 1000;
+    width: 320px; max-height: calc(100% - 40px); overflow-y: auto;
+    background: rgba(255,255,255,.95); border-radius: 8px;
+    box-shadow: 0 1px 6px rgba(0,0,0,.4); padding: 12px 14px; font-size: 13px;
+  }
+  #panel h1 { font-size: 15px; margin: 0 0 6px; }
+  #panel h2 { font-size: 13px; margin: 10px 0 4px; }
+  #panel table { border-collapse: collapse; width: 100%; }
+  #panel td, #panel th { padding: 2px 6px 2px 0; text-align: left; }
+  .nota { color: #555; font-size: 11px; margin-top: 10px; }
+  .mon { color: #c95f00; } .gua { color: #0055aa; }
+</style>
+</head>
+<body>
+<div id="mapa"></div>
+<div id="panel">
+  <h1>¿Cuándo sale el Sol detrás del cerro?</h1>
+  <div id="resultados">
+    Haz clic en cualquier punto del mapa (o arrastra el marcador) para saber
+    en qué fechas de 2026 el Sol sale exactamente detrás de
+    <span class="mon"><b>Monserrate</b></span> y de
+    <span class="gua"><b>Guadalupe</b></span> visto desde allí.
+    <br><br>
+    Las dos curvas son los loci de los solsticios: desde ellas la alineación
+    ocurre el 21 de junio (Monserrate) y el 21 de diciembre (Guadalupe).
+  </div>
+  <div class="nota">
+    Supuestos: sin refracción atmosférica (corre los eventos ~1–2 min cerca
+    del horizonte), observador a 2600 m (sabana plana; menos válido al
+    oriente de la carrera 7.ª), y geometría pura: los edificios pueden tapar
+    la vista real. Hora local UTC−5.
+  </div>
+</div>
+
+<script>
+"use strict";
+
+// ---------- Constantes y puntos fijos (idénticos al script de Python) ------
+const D2R = Math.PI / 180;            // grados → radianes
+const R   = 6371000;                  // radio terrestre medio [m]
+const PLAZA = { lat: 4.59806, lon: -74.07611, h: 2600 };  // origen ENU
+const CIMAS = [
+  { nombre: "Monserrate", lat: 4.60563, lon: -74.05542, h: 3152,
+    color: "#c95f00", clase: "mon", solsticio: "2026-06-21" },
+  { nombre: "Guadalupe",  lat: 4.59194, lon: -74.05417, h: 3360,
+    color: "#0055aa", clase: "gua", solsticio: "2026-12-21" },
+];
+
+// Conversión geográfica ↔ ENU local (aproximación esférica, como en Python)
+const cosLat0 = Math.cos(PLAZA.lat * D2R);
+function aENU(lat, lon) {             // → {x: Este [m], y: Norte [m]}
+  return { x: (lon - PLAZA.lon) * D2R * R * cosLat0,
+           y: (lat - PLAZA.lat) * D2R * R };
+}
+function aGeo(x, y) {                 // inversa: ENU → [lat, lon]
+  return [ PLAZA.lat + y / (R * D2R),
+           PLAZA.lon + x / (R * D2R * cosLat0) ];
+}
+CIMAS.forEach(c => { const p = aENU(c.lat, c.lon); c.x = p.x; c.y = p.y;
+                     c.u = c.h - PLAZA.h; });  // u = altura sobre el suelo
+
+// ---------- Posición del Sol (fórmulas NOAA, geocéntricas, sin refracción) -
+// Devuelve {az, alt} en grados (azimut desde el norte, sentido horario)
+// calculado en la plaza: mover el observador ~1 km cambia <0.02°.
+function solAzAlt(unixMs) {
+  const jd = unixMs / 86400000 + 2440587.5;       // día juliano
+  const T  = (jd - 2451545) / 36525;              // siglos desde J2000
+  const L0 = (280.46646 + T * (36000.76983 + T * 3.032e-4)) % 360; // long. media
+  const M  = (357.52911 + T * (35999.05029 - T * 1.537e-4)) * D2R; // anomalía media
+  const C  = (1.914602 - T * (0.004817 + 1.4e-5 * T)) * Math.sin(M)
+           + (0.019993 - 1.01e-4 * T) * Math.sin(2 * M)
+           + 2.89e-4 * Math.sin(3 * M);           // ecuación del centro
+  const om  = (125.04 - 1934.136 * T) * D2R;      // nodo lunar (nutación aprox.)
+  const lam = (L0 + C - 0.00569 - 0.00478 * Math.sin(om)) * D2R; // long. aparente
+  const eps = (23.439291 - 0.013004 * T + 0.00256 * Math.cos(om)) * D2R; // oblicuidad
+  const dec = Math.asin(Math.sin(eps) * Math.sin(lam));           // declinación
+  const ra  = Math.atan2(Math.cos(eps) * Math.sin(lam), Math.cos(lam)); // ascensión recta
+  const gmst = (280.46061837 + 360.98564736629 * (jd - 2451545)) % 360; // t. sidéreo
+  const H   = (gmst + PLAZA.lon) * D2R - ra;      // ángulo horario
+  const lat = PLAZA.lat * D2R;
+  const alt = Math.asin(Math.sin(lat) * Math.sin(dec)
+                      + Math.cos(lat) * Math.cos(dec) * Math.cos(H));
+  const az  = Math.atan2(-Math.cos(dec) * Math.sin(H),
+                          Math.sin(dec) * Math.cos(lat)
+                        - Math.cos(dec) * Math.sin(lat) * Math.cos(H));
+  return { az: ((az / D2R) + 360) % 360, alt: alt / D2R };
+}
+
+// ---------- Utilidades de tiempo (todo en hora local fija UTC−5) -----------
+const MS_DIA = 86400000;
+const BASE = Date.UTC(2026, 0, 1, 5, 0, 0);  // 2026-01-01 00:00 UTC−5, en ms
+const MESES = ["ene","feb","mar","abr","may","jun",
+               "jul","ago","sep","oct","nov","dic"];
+function fmtFecha(dia) {              // día entero desde el 1.º de enero → "21 jun"
+  const d = new Date(BASE + dia * MS_DIA + 12 * 3600000); // mediodía, evita bordes
+  return d.getUTCDate() + " " + MESES[d.getUTCMonth()] +
+         (d.getUTCFullYear() !== 2026 ? " " + d.getUTCFullYear() : "");
+}
+function fmtHora(h) {                 // horas decimales → "06:02"
+  const m = Math.round(h * 60);
+  return String(Math.floor(m / 60)).padStart(2, "0") + ":" +
+         String(m % 60).padStart(2, "0");
+}
+
+// En la mañana del día `dia`, halla la hora local en que la altitud del Sol
+// cruza `altReq` subiendo, y el azimut en ese instante (interpolación lineal
+// sobre una malla de 3 minutos). Devuelve null si ese día el Sol no alcanza
+// esa altitud.
+function cruceMatutino(dia, altReq) {
+  const t0 = BASE + dia * MS_DIA;
+  let prev = solAzAlt(t0 + 5 * 3600000), hPrev = 5;
+  for (let h = 5.05; h <= 12.5; h += 0.05) {
+    const s = solAzAlt(t0 + h * 3600000);
+    if (prev.alt < altReq && s.alt >= altReq) {
+      const f = (altReq - prev.alt) / (s.alt - prev.alt);  // fracción del paso
+      let dAz = s.az - prev.az;                            // (sin saltos de 360°)
+      if (dAz > 180) dAz -= 360; if (dAz < -180) dAz += 360;
+      return { hora: hPrev + f * (h - hPrev), az: prev.az + f * dAz };
+    }
+    prev = s; hPrev = h;
+  }
+  return null;
+}
+
+// ---------- Búsqueda anual: ¿qué días hay alineación con una cima? ---------
+// Desde el observador (x, y), el Sol está "detrás de la cima" cuando su azimut
+// y altitud coinciden con la dirección a la cima. La altitud requerida es fija
+// (atan(u / distancia)); cada día se mira el azimut del Sol cuando alcanza esa
+// altitud y se buscan los días en que la diferencia cruza por cero.
+function alineaciones(obs, cima) {
+  const dE = cima.x - obs.x, dN = cima.y - obs.y;
+  const dist  = Math.hypot(dE, dN);                       // distancia horizontal
+  const azReq = (Math.atan2(dE, dN) / D2R + 360) % 360;   // rumbo hacia la cima
+  const altReq = Math.atan2(cima.u, dist) / D2R;          // altitud requerida
+  // Diferencia de azimut (Sol − cima) para cada día del año (+1 para el cierre)
+  const daz = [], horas = [];
+  for (let d = 0; d <= 366; d++) {
+    const c = cruceMatutino(d, altReq);
+    if (c === null) { daz.push(NaN); horas.push(NaN); continue; }
+    let e = c.az - azReq;
+    if (e > 180) e -= 360; if (e < -180) e += 360;
+    daz.push(e); horas.push(c.hora);
+  }
+  // Cruces por cero (alineación exacta) y mínimos rasantes (≤ radio solar):
+  // un punto sobre el locus del solsticio toca cero sin cambiar de signo.
+  const eventos = [];
+  for (let d = 0; d < 366; d++) {
+    if (isNaN(daz[d]) || isNaN(daz[d + 1])) continue;
+    if (daz[d] === 0 || daz[d] * daz[d + 1] < 0) {
+      const f = Math.abs(daz[d]) / (Math.abs(daz[d]) + Math.abs(daz[d + 1]));
+      eventos.push({ dia: f < 0.5 ? d : d + 1, rasante: false });
+    }
+  }
+  for (let d = 1; d < 366; d++) {       // mínimos locales sin cruce (rasantes)
+    if (isNaN(daz[d - 1]) || isNaN(daz[d]) || isNaN(daz[d + 1])) continue;
+    const a = Math.abs(daz[d]);
+    if (a < 0.27 && a <= Math.abs(daz[d - 1]) && a <= Math.abs(daz[d + 1]) &&
+        !eventos.some(e => Math.abs(e.dia - d) < 2))
+      eventos.push({ dia: d, rasante: true });
+  }
+  // Dos cruces a ≤3 días (tangencia cerca del solsticio) son un solo evento
+  eventos.sort((a, b) => a.dia - b.dia);
+  const unicos = [];
+  for (const e of eventos)
+    if (!unicos.length || e.dia - unicos[unicos.length - 1].dia > 3) unicos.push(e);
+    else unicos[unicos.length - 1].rasante = false;
+  unicos.forEach(e => { e.hora = horas[e.dia]; });
+  return { dist, azReq, altReq, eventos: unicos };
+}
+
+// ---------- Loci de los solsticios (las dos curvas de referencia) ----------
+// Para cada altitud del Sol entre 0.5° y 25°, el punto desde el cual se ve el
+// Sol exactamente detrás de la cima esa mañana (misma fórmula del script).
+function locus(cima) {
+  const dia = Math.round((Date.UTC(...cima.solsticio.split("-")
+               .map((v, i) => i === 1 ? v - 1 : +v), 5) - BASE) / MS_DIA);
+  const pts = [];
+  for (let alt = 0.5; alt <= 25.001; alt += 0.25) {
+    const c = cruceMatutino(dia, alt);
+    if (c === null) continue;
+    const horiz = cima.u / Math.tan(alt * D2R);   // distancia horizontal al punto
+    pts.push(aGeo(cima.x - horiz * Math.sin(c.az * D2R),
+                  cima.y - horiz * Math.cos(c.az * D2R)));
+  }
+  return pts;
+}
+
+// ---------- Mapa ------------------------------------------------------------
+const mapa = L.map("mapa").setView([4.601, -74.075], 14);
+// Teselas de CARTO (basadas en OSM): el servidor oficial de OSM bloquea las
+// paginas abiertas como archivo local (file://) y muestra "Access Blocked".
+L.tileLayer("https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png",
+  { maxZoom: 20, subdomains: "abcd",
+    attribution: "&copy; OpenStreetMap contributors &copy; CARTO" }).addTo(mapa);
+
+// Plaza y cimas
+L.circleMarker([PLAZA.lat, PLAZA.lon], { radius: 6, color: "#222",
+    fillColor: "#fff", fillOpacity: 1 }).addTo(mapa)
+  .bindTooltip("Plaza de Bolívar", { permanent: true, direction: "left" });
+for (const c of CIMAS) {
+  L.circleMarker([c.lat, c.lon], { radius: 7, color: c.color,
+      fillColor: c.color, fillOpacity: .9 }).addTo(mapa)
+    .bindTooltip(`${c.nombre} (${c.h} m)`, { permanent: true, direction: "right" });
+  L.polyline(locus(c), { color: c.color, weight: 2.5, opacity: .8 }).addTo(mapa)
+    .bindTooltip(`Locus del ${fmtFecha(Math.round(
+      (Date.UTC(...c.solsticio.split("-").map((v,i)=>i===1?v-1:+v), 5) - BASE)
+      / MS_DIA))}: el Sol sale detrás de ${c.nombre}`, { sticky: true });
+}
+
+// ---------- Interacción: clic / marcador arrastrable ------------------------
+let marcador = null, visuales = [];     // marcador del observador y líneas a las cimas
+function fmtEvento(e) {
+  return `<b>${fmtFecha(e.dia)}</b> a las <b>${fmtHora(e.hora)}</b>` +
+         (e.rasante ? " <i>(rasante)</i>" : "");
+}
+function calcular(latlng) {
+  const obs = aENU(latlng.lat, latlng.lng);
+  visuales.forEach(v => mapa.removeLayer(v)); visuales = [];
+  let html = `<b>Punto:</b> ${latlng.lat.toFixed(5)}, ${latlng.lng.toFixed(5)}`;
+  for (const c of CIMAS) {
+    const r = alineaciones(obs, c);
+    html += `<h2 class="${c.clase}">${c.nombre}</h2>
+      <table><tr><td>Distancia</td><td>${(r.dist/1000).toFixed(2)} km,
+        rumbo ${r.azReq.toFixed(1)}°</td></tr>
+      <tr><td>Altura de la cima</td><td>${r.altReq.toFixed(1)}° sobre el horizonte</td></tr></table>`;
+    html += r.eventos.length
+      ? "El Sol sale justo detrás: " + r.eventos.map(fmtEvento).join(" y ") + "."
+      : "<i>Desde aquí el Sol nunca sale detrás de esta cima en 2026.</i>";
+    if (r.eventos.length)               // línea de mira hacia la cima
+      visuales.push(L.polyline([[latlng.lat, latlng.lng], [c.lat, c.lon]],
+        { color: c.color, weight: 1.5, dashArray: "5 5" }).addTo(mapa));
+  }
+  document.getElementById("resultados").innerHTML = html;
+}
+mapa.on("click", ev => {
+  if (!marcador) {
+    marcador = L.marker(ev.latlng, { draggable: true }).addTo(mapa)
+      .bindTooltip("Observador", { direction: "bottom" });
+    marcador.on("drag dragend", e => calcular(e.target.getLatLng()));
+  } else marcador.setLatLng(ev.latlng);
+  calcular(ev.latlng);
+});
+</script>
+</body>
+</html>
